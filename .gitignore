@@ -136,6 +136,9 @@ ENV/
 env.bak/
 venv.bak/
 
+# Kişisel CV (örnek: shared/data/resume.example.md)
+shared/data/resume.md
+
 # Spyder project settings
 .spyderproject
 .spyproject

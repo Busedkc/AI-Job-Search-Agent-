@@ -1,0 +1,8 @@
+[
+  {"id": 1, "title": "Junior Machine Learning Engineer", "company": "Nova Analytics", "location": "İstanbul", "remote": false, "skills": ["python", "pytorch", "sql"], "deadline": "2026-10-25"},
+  {"id": 2, "title": "AI Engineer (LLM / RAG)", "company": "Kuzey Teknoloji", "location": "İstanbul", "remote": true, "skills": ["python", "langchain", "rag", "vector db"], "deadline": "2026-10-18"},
+  {"id": 3, "title": "Data Scientist", "company": "Mavi Finans", "location": "Ankara", "remote": false, "skills": ["python", "statistics", "time series"], "deadline": "2026-11-01"},
+  {"id": 4, "title": "Backend Developer", "company": "Liman Yazılım", "location": "İzmir", "remote": true, "skills": ["java", "spring", "postgresql"], "deadline": "2026-10-30"},
+  {"id": 5, "title": "NLP Engineer", "company": "Atlas AI", "location": "İstanbul", "remote": true, "skills": ["python", "transformers", "nlp", "llm"], "deadline": "2026-10-20"},
+  {"id": 6, "title": "MLOps Engineer", "company": "Bulut Labs", "location": "İstanbul", "remote": false, "skills": ["docker", "kubernetes", "python", "mlflow"], "deadline": "2026-11-10"}
+]

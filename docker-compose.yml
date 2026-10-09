@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: postgres:17                # Docker Hub'daki resmi Postgres imajı
+    container_name: job-agent-postgres
+    environment:                      # değerler repo kökündeki .env'den gelir
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "5433:5432"                   # bilgisayarın:5433 -> container:5432
+    volumes:
+      - pgdata:/var/lib/postgresql/data   # veriler container silinse de burada kalır
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  pgdata:

@@ -1,0 +1,14 @@
+# Ücretsiz key: https://console.groq.com/keys
+GROQ_API_KEY=
+
+# "provider:model" formatı
+MODEL=groq:openai/gpt-oss-120b
+# Alternatif: groq:qwen/qwen3.8-27b
+
+# Postgres (docker-compose.yml bu üçünü okur)
+POSTGRES_USER=jobagent
+POSTGRES_PASSWORD=jobagent
+POSTGRES_DB=jobagent
+
+# Python'un Postgres'e bağlandığı adres (port 5433: docker-compose'daki eşleme)
+DATABASE_URL=postgresql://jobagent:jobagent@localhost:5433/jobagent
