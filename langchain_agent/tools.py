@@ -3,11 +3,18 @@ from dataclasses import dataclass
 from typing import NotRequired
 
 from langchain.agents import AgentState
+from langchain.chat_models import init_chat_model
 from langchain.messages import ToolMessage
 from langchain.tools import ToolRuntime, tool
 from langgraph.types import Command
 
 from shared import job_source
+from shared.config import SCORER_MODEL
+from shared.scoring import SCORING_PROMPT, MatchReport, build_scoring_input
+
+# Değerlendirme için ayrı bir model çağrısı: temperature=0 ile her seferinde aynı girdiye
+# mümkün olduğunca aynı skor. with_structured_output cevabı MatchReport'a zorlar.
+scorer = init_chat_model(SCORER_MODEL, temperature=0).with_structured_output(MatchReport)
 
 
 @dataclass
@@ -73,3 +80,24 @@ def list_tracked_jobs(runtime: ToolRuntime[Context, JobAgentState]) -> str:
     if not tracked:
         return "Takip listesi boş."
     return json.dumps(sorted(tracked, key=lambda j: j["deadline"]), ensure_ascii=False)
+
+
+@tool
+def evaluate_jobs(job_ids: list[int], runtime: ToolRuntime[Context]) -> str:
+    """İlanları kullanıcının CV'sine göre 0-100 arası puanlar ve gerekçelendirir.
+    Uygunluğa kendin karar verme; search_jobs'tan sonra bulduğun ilanların id'leriyle bunu çağır.
+
+    Args:
+        job_ids: Değerlendirilecek ilanların id'leri.
+    """
+    jobs = [j for j in (job_source.get_job(i) for i in job_ids) if j]
+    if not jobs:
+        return "Değerlendirilecek ilan bulunamadı."
+
+    report: MatchReport = scorer.invoke([
+        {"role": "system", "content": SCORING_PROMPT},
+        {"role": "user", "content": build_scoring_input(runtime.context.resume, jobs)},
+    ])
+    # Pydantic doğrulamasından geçmiş nesne: alanlar ve tipler garanti
+    ranked = sorted(report.matches, key=lambda m: m.score, reverse=True)
+    return json.dumps([m.model_dump() for m in ranked], ensure_ascii=False)

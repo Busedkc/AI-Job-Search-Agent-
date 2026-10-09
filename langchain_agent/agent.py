@@ -1,11 +1,13 @@
 import sys
 
 from langchain.agents import create_agent
+from langchain.agents.middleware import ModelRetryMiddleware, ToolRetryMiddleware
 from langgraph.checkpoint.postgres import PostgresSaver
 
 from langchain_agent.tools import (
     Context,
     JobAgentState,
+    evaluate_jobs,
     get_my_profile,
     list_tracked_jobs,
     search_jobs,
@@ -19,11 +21,11 @@ from shared.resume import load_resume
 LANGCHAIN_PROMPT = SYSTEM_PROMPT + """
 
 Kullanıcı "bana uygun" gibi kişisel bir istekte bulunursa önce get_my_profile ile
-profilini oku, sonra hedef rollerine göre search_jobs ile ara.
-search_jobs'ta location parametresini kullanma; şehir ve remote uygunluğunu tercihlere göre sen değerlendir.
-Tercihlerine uymayan ilanları (istemediği roller, uygun olmayan şehir/çalışma şekli) ele
-ve neden elediğini tek cümleyle belirt.
-İlanları listelerken id'lerini de göster ki kullanıcı "2'yi takibe al" diyebilsin.
+profilini oku, sonra search_jobs'u TEK SEFERDE tüm hedef rollerin anahtar kelimeleriyle çağır
+(location parametresini kullanma).
+Uygunluğa kendin karar verme: bulunan tüm ilanların id'leriyle evaluate_jobs'u BİR KEZ çağır ve
+onun skorlarına göre sırala. Tabloda id, pozisyon, şirket, skor ve kısa gerekçe göster;
+Tabloya sadece “uygun” ve “kısmen uygun” ilanları koy; “uygun değil” olanları tablonun altında tek satırda gerekçesiyle belirt.
 Kullanıcı bir ilanı takibe almak isterse track_job, takip listesini sorarsa list_tracked_jobs kullan."""
 
 
@@ -31,11 +33,16 @@ def build_agent(checkpointer):
     """Agent'ı verilen checkpointer ile kurar. Checkpointer değişse de agent tanımı aynı kalır."""
     return create_agent(
         model=MODEL,
-        tools=[get_my_profile, search_jobs, track_job, list_tracked_jobs],
+        tools=[get_my_profile, search_jobs, evaluate_jobs, track_job, list_tracked_jobs],
         system_prompt=LANGCHAIN_PROMPT,
         context_schema=Context,
         state_schema=JobAgentState,
         checkpointer=checkpointer,
+        # Rate limit (429) gibi geçici hatalarda bekleyip tekrar dener: 2s, 4s, 8s, 16s
+        middleware=[
+            ModelRetryMiddleware(max_retries=4, initial_delay=2.0),
+            ToolRetryMiddleware(max_retries=4, initial_delay=2.0, tools=["evaluate_jobs"]),
+        ],
     )
 
 
