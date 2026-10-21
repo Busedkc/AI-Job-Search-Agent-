@@ -1,3 +1,4 @@
+name: aijobsearchagent
 services:
   postgres:
     image: postgres:17                # Docker Hub'daki resmi Postgres imajı

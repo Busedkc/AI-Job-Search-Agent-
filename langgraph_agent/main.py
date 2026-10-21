@@ -1,0 +1,99 @@
+import sys
+
+from langgraph.checkpoint.postgres import PostgresSaver
+from langgraph.types import Command
+
+from langgraph_agent.graph import Context, build_graph
+from shared.config import DATABASE_URL
+from shared.resume import load_resume
+
+
+def describe_update(node: str, update: dict) -> str | None:
+    """Her node bitince ekrana tek satırlık özet."""
+    if node == "router":
+        return f"🔀 router: niyet = {update['intent']}" + (f", id'ler = {update['job_ids']}" if update.get("job_ids") else "")
+    if node == "plan_search":
+        return f"📝 plan_search: '{update['keywords']}'"
+    if node == "search":
+        return f"🔎 search: {len(update['jobs'])} ilan bulundu"
+    if node == "score":
+        return "📊 score: " + ", ".join(f"#{m['job_id']}={m['score']}" for m in update["matches"])
+    if node == "__interrupt__":
+        return "✋ confirm_track: onay bekleniyor"
+    if node == "confirm_track":
+        return "✅ confirm_track: devam" if update.get("confirmed") else "❌ confirm_track: vazgeçildi"
+    if node == "track":
+        return f"📌 track: state güncellendi, takipte {len(update['tracked_jobs'])} ilan"
+    if node == "list_tracked":
+        return "📌 list_tracked: liste hazırlandı"
+    return None
+
+
+def stream_graph(graph, graph_input, context: Context, config: dict) -> None:
+    """graph_input: yeni soru için {"messages": [...]}, interrupt'tan devam için Command(resume=...)."""
+    streamed = False  # respond LLM ile mi yazdı (token geldi mi)?
+    for chunk in graph.stream(
+        graph_input,
+        config=config,
+        context=context,
+        stream_mode=["messages", "updates"],
+        version="v2",
+    ):
+        if chunk["type"] == "messages":
+            token, metadata = chunk["data"]
+            # router ve score da model çağırıyor ama onların çıktısı JSON; sadece respond'u akıt
+            if metadata["langgraph_node"] == "respond" and token.content:
+                print(token.content, end="", flush=True)
+                streamed = True
+
+        elif chunk["type"] == "updates":
+            for node, update in chunk["data"].items():
+                if node == "respond" and not streamed:
+                    print(update["messages"][-1].content)  # LLM'siz cevap: token akmadı, tek seferde bas
+                    continue
+                line = describe_update(node, update if isinstance(update, dict) else {})
+                if line:
+                    print(line)
+    print()
+
+
+if __name__ == "__main__":
+    thread_id = "lg-" + (sys.argv[1] if len(sys.argv) > 1 else "default")
+    config = {"configurable": {"thread_id": thread_id}}
+    context = Context(resume=load_resume())
+
+    with PostgresSaver.from_conn_string(DATABASE_URL) as checkpointer:
+        checkpointer.setup()
+        graph = build_graph(checkpointer)
+
+        try:
+            print(graph.get_graph().draw_ascii())  # grandalf kuruluysa kutulu çizim
+        except ImportError:
+            print(graph.get_graph().draw_mermaid())  # yoksa Mermaid metni (paket gerektirmez)
+        state = graph.get_state(config).values
+        print(f"Thread: {thread_id} | kayıtlı mesaj: {len(state.get('messages', []))} | "
+              f"takipte: {len(state.get('tracked_jobs', []))} ilan")
+        print("Çıkmak için 'q', state'i görmek için '/state' yaz.\n")
+
+        while True:
+            question = input("Sen: ").strip()
+            if question.lower() in {"q", "quit", "exit"}:
+                break
+            if question == "/state":
+                s = graph.get_state(config).values
+                print(f"mesaj: {len(s.get('messages', []))} | intent: {s.get('intent')}")
+                print(f"matches: {[(m['job_id'], m['score']) for m in s.get('matches', [])]}")
+                print(f"tracked_jobs: {[j['title'] for j in s.get('tracked_jobs', [])]}\n")
+                continue
+            print("Agent:")
+            stream_graph(graph, {"messages": [{"role": "user", "content": question}]}, context, config)
+
+            # Graph interrupt'ta durduysa: soruyu göster, cevabı al, kaldığı yerden devam et
+            while interrupts := graph.get_state(config).interrupts:
+                payload = interrupts[0].value
+                print(f"\n{payload['question']}")
+                for job in payload["jobs"]:
+                    print(f"  {job}")
+                answer = input("(e/h): ").strip()
+                stream_graph(graph, Command(resume=answer), context, config)
+            print()

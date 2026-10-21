@@ -1,8 +1,10 @@
 """İlan kaynağı. Framework'ten bağımsız saf Python.
+
 LangChain ve LangGraph versiyonları bu fonksiyonları kendi tool/node'larına sarar.
 Mock'tan gerçek API'ye geçince sadece bu dosya değişecek.
 """
 import json
+from datetime import date
 
 from shared.config import DATA_DIR
 
@@ -27,3 +29,8 @@ def search_jobs(keywords: str, location: str | None = None) -> list[dict]:
 
 def get_job(job_id: int) -> dict | None:
     return next((j for j in load_jobs() if j["id"] == job_id), None)
+
+
+def is_expired(job: dict, today: date | None = None) -> bool:
+    """Son başvuru tarihi geçmiş mi? (deadline: "YYYY-MM-DD")"""
+    return date.fromisoformat(job["deadline"]) < (today or date.today())

@@ -1,0 +1,218 @@
+"""LangGraph Adım 3: sabit akış + yönlendirme + interrupt (onay).
+
+    START → router ─┬─ search → plan_search → search → score ──────────────┐
+                    ├─ track  → confirm_track ──(onay)──→ track ───────────┤
+                    │                        └──(ret)──────────────────────┤
+                    ├─ list   → list_tracked ─────────────────┼→ respond → END
+                    └─ other  ────────────────────────────────┘
+
+LangChain'de hangi tool'un ne zaman çağrılacağına model karar veriyordu.
+Burada akışı graph belirliyor; model sadece router (sınıflandırma), score ve respond'da çalışıyor.
+"""
+import json
+from dataclasses import dataclass
+from typing import Annotated, Literal, NotRequired, TypedDict
+
+from langchain.chat_models import init_chat_model
+from langchain.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import add_messages
+from langgraph.runtime import Runtime
+from langgraph.types import RetryPolicy, interrupt
+from pydantic import BaseModel, Field
+
+from shared import job_source
+from shared.config import MODEL, SCORER_MODEL
+from shared.resume import parse_target_roles
+from shared.scoring import SCORING_PROMPT, MatchReport, build_scoring_input
+
+
+# --- Context ve State ------------------------------------------------------
+@dataclass
+class Context:
+    resume: str
+
+
+class State(TypedDict):
+    messages: Annotated[list[AnyMessage], add_messages]
+    # LangChain'de bu veriler mesajların içinde JSON metni olarak duruyordu.
+    # Burada her biri ayrı, tipli bir state alanı.
+    intent: NotRequired[str]
+    job_ids: NotRequired[list[int]]      # router'ın mesajdan çıkardığı id'ler (takip için)
+    keywords: NotRequired[str]
+    jobs: NotRequired[list[dict]]
+    matches: NotRequired[list[dict]]
+    tracked_jobs: NotRequired[list[dict]]
+    action_result: NotRequired[str]      # track/list node'unun respond'a bıraktığı not
+    confirmed: NotRequired[bool]         # confirm_track'te kullanıcının cevabı
+
+
+# --- Modeller ----------------------------------------------------------------
+class Route(BaseModel):
+    intent: Literal["search", "track", "list", "other"] = Field(
+        description="search: ilan arama/öneri isteği; track: bir ilanı takibe alma; "
+                    "list: takip listesini görme; other: diğer her şey")
+    job_ids: list[int] = Field(default_factory=list,
+                               description="track ise kullanıcının bahsettiği ilan id'leri")
+
+
+router_model = init_chat_model(MODEL, temperature=0).with_structured_output(Route)
+scorer = init_chat_model(SCORER_MODEL, temperature=0).with_structured_output(MatchReport)
+chat_model = init_chat_model(MODEL)
+
+RETRY = RetryPolicy(max_attempts=5, initial_interval=2.0)
+
+
+def chat_history(messages: list[AnyMessage], last_n: int = 6) -> list[AnyMessage]:
+    """Modele sadece kullanıcı ve asistan metinlerini gönder (tool mesajları vs. yok)."""
+    text_msgs = [m for m in messages if isinstance(m, (HumanMessage, AIMessage)) and m.content]
+    return text_msgs[-last_n:]
+
+
+# --- Node'lar ----------------------------------------------------------------
+def router(state: State) -> dict:
+    """Kullanıcının ne istediğini sınıflandırır. Yolu bu karar + conditional edge belirler."""
+    route: Route = router_model.invoke([
+        SystemMessage("Kullanıcının son mesajının niyetini sınıflandır."),
+        *chat_history(state["messages"], last_n=3),
+    ])
+    # action_result'ı sıfırla: önceki turdan kalan not bu turun cevabına karışmasın
+    return {"intent": route.intent, "job_ids": route.job_ids, "action_result": ""}
+
+
+def route_after_router(state: State) -> str:
+    return {"search": "plan_search", "track": "confirm_track", "list": "list_tracked"}.get(
+        state["intent"], "respond")
+
+
+def plan_search(state: State, runtime: Runtime[Context]) -> dict:
+    """Arama kelimelerini CV'den düz Python ile çıkarır. LLM yok, token yok."""
+    roles = parse_target_roles(runtime.context.resume)
+    keywords = " ".join(roles).replace("/", " ") or "machine learning engineer"
+    return {"keywords": keywords}
+
+
+def search(state: State) -> dict:
+    return {"jobs": job_source.search_jobs(state["keywords"])}
+
+
+def score(state: State, runtime: Runtime[Context]) -> dict:
+    """Her aramada bir kez çalışır. Model "skorlamayı atlayayım" diyemez."""
+    if not state["jobs"]:
+        return {"matches": []}
+    report: MatchReport = scorer.invoke([
+        SystemMessage(SCORING_PROMPT),
+        HumanMessage(build_scoring_input(runtime.context.resume, state["jobs"])),
+    ])
+    ranked = sorted(report.matches, key=lambda m: m.score, reverse=True)
+    return {"matches": [m.model_dump() for m in ranked]}
+
+
+def confirm_track(state: State) -> dict:
+    """Human-in-the-loop: takibe almadan önce kullanıcıya sorar.
+
+    interrupt() graph'ı burada durdurur, state checkpointer'a yazılır. Command(resume=...)
+    ile devam edilince bu node BAŞTAN çalışır ve interrupt() kullanıcının cevabını döndürür.
+    Bu yüzden interrupt'tan önceki kod deterministik olmalı (burada sadece okuma yapıyoruz).
+    """
+    tracked_ids = {j["id"] for j in state.get("tracked_jobs", [])}
+    candidates = [job for i in state.get("job_ids", [])
+                  if i not in tracked_ids and (job := job_source.get_job(i))]
+    if not candidates:
+        return {"confirmed": True}  # sorulacak bir şey yok; track node durumu açıklar
+
+    jobs = [f"#{j['id']} {j['title']} – {j['company']} (son başvuru {j['deadline']}"
+            + (", ⚠️ SÜRESİ GEÇMİŞ" if job_source.is_expired(j) else "") + ")"
+            for j in candidates]
+    answer = interrupt({"question": "Bu ilanları takibe alayım mı?", "jobs": jobs})
+
+    if str(answer).strip().lower() in {"e", "evet", "y", "yes"}:
+        return {"confirmed": True}
+    return {"confirmed": False, "action_result": "Tamam, takibe almadım."}
+
+
+def route_after_confirm(state: State) -> str:
+    return "track" if state["confirmed"] else "respond"
+
+
+def track(state: State) -> dict:
+    tracked = list(state.get("tracked_jobs", []))
+    notes = []
+    for job_id in state.get("job_ids", []):
+        job = job_source.get_job(job_id)
+        if job is None:
+            notes.append(f"{job_id} id'li ilan bulunamadı.")
+        elif any(j["id"] == job_id for j in tracked):
+            notes.append(f"'{job['title']}' zaten takipte.")
+        else:
+            tracked.append(job)
+            expired = " (dikkat: son başvuru tarihi geçmiş)" if job_source.is_expired(job) else ""
+            notes.append(f"'{job['title']}' ({job['company']}) takibe alındı, son başvuru {job['deadline']}{expired}.")
+    if not notes:
+        notes.append("Hangi ilanı takibe almamı istediğini anlayamadım, id'sini yazar mısın?")
+    return {"tracked_jobs": tracked, "action_result": " ".join(notes)}
+
+
+def list_tracked(state: State) -> dict:
+    tracked = sorted(state.get("tracked_jobs", []), key=lambda j: j["deadline"])
+    if not tracked:
+        return {"action_result": "Takip listen boş."}
+    lines = [f"- #{j['id']} {j['title']} – {j['company']} (son başvuru {j['deadline']})"
+             + (" ⚠️ süresi geçmiş" if job_source.is_expired(j) else "")
+             for j in tracked]
+    return {"action_result": "Takip listen:\n" + "\n".join(lines)}
+
+
+RESPOND_PROMPT = """Sen bir iş arama asistanısın. Türkçe, kısa ve doğal cevap ver.
+Sadece aşağıdaki verilere dayan, uydurma ilan verme. Kurallarından bahsetme."""
+
+
+def respond(state: State) -> dict:
+    """Kullanıcıya cevabın yazıldığı tek yer. Arama/sohbette LLM yazar (veriyi system
+    mesajına koyar, mesaj geçmişine değil); takip/listelemede kodun ürettiği metin aynen döner."""
+    intent = state.get("intent", "other")
+    if intent in ("track", "list"):
+        # Sonucu kod zaten kesin olarak üretti. LLM'e yeniden yazdırmak sadece hata riski
+        # ekliyor (model bir kez "takibe alındı"yı "bilgi bulunamadı" diye özetledi).
+        return {"messages": [AIMessage(state.get("action_result", ""))]}
+    if intent == "search":
+        data = (f"Değerlendirilmiş ilanlar (skora göre sıralı):\n"
+                f"{json.dumps(state.get('matches', []), ensure_ascii=False)}\n"
+                f"İlan detayları:\n{json.dumps(state.get('jobs', []), ensure_ascii=False)}\n\n"
+                "Tabloya sadece 'uygun' ve 'kısmen uygun' ilanları koy (id, pozisyon, şirket, skor, kısa gerekçe); "
+                "'uygun değil' olanları tablonun altında tek satırda gerekçesiyle belirt.")
+    else:
+        data = "İlan aramak, takibe almak veya takip listesini görmek için yardımcı olabileceğini belirt."
+
+    response = chat_model.invoke([
+        SystemMessage(f"{RESPOND_PROMPT}\n\n{data}"),
+        *chat_history(state["messages"]),
+    ])
+    return {"messages": [response]}
+
+
+# --- Graph -------------------------------------------------------------------
+def build_graph(checkpointer=None):
+    builder = StateGraph(State, context_schema=Context)
+
+    builder.add_node("router", router, retry_policy=RETRY)
+    builder.add_node("plan_search", plan_search)
+    builder.add_node("search", search)
+    builder.add_node("score", score, retry_policy=RETRY)
+    builder.add_node("confirm_track", confirm_track)
+    builder.add_node("track", track)
+    builder.add_node("list_tracked", list_tracked)
+    builder.add_node("respond", respond, retry_policy=RETRY)
+
+    builder.add_edge(START, "router")
+    builder.add_conditional_edges("router", route_after_router,
+                                  ["plan_search", "confirm_track", "list_tracked", "respond"])
+    builder.add_conditional_edges("confirm_track", route_after_confirm, ["track", "respond"])
+    builder.add_edge("plan_search", "search")
+    builder.add_edge("search", "score")
+    builder.add_edge("score", "respond")
+    builder.add_edge("track", "respond")
+    builder.add_edge("list_tracked", "respond")
+    builder.add_edge("respond", END)
+
+    return builder.compile(checkpointer=checkpointer)
