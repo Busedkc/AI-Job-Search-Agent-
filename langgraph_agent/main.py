@@ -1,10 +1,11 @@
 import sys
 
 from langgraph.checkpoint.postgres import PostgresSaver
+from langgraph.store.postgres import PostgresStore
 from langgraph.types import Command
 
 from langgraph_agent.graph import Context, build_graph
-from shared.config import DATABASE_URL
+from shared.config import DATABASE_URL, USER_ID
 from shared.resume import load_resume
 
 
@@ -23,7 +24,7 @@ def describe_update(node: str, update: dict) -> str | None:
     if node == "confirm_track":
         return "✅ confirm_track: devam" if update.get("confirmed") else "❌ confirm_track: vazgeçildi"
     if node == "track":
-        return f"📌 track: state güncellendi, takipte {len(update['tracked_jobs'])} ilan"
+        return "📌 track: store işlendi"
     if node == "list_tracked":
         return "📌 list_tracked: liste hazırlandı"
     return None
@@ -60,11 +61,15 @@ def stream_graph(graph, graph_input, context: Context, config: dict) -> None:
 if __name__ == "__main__":
     thread_id = "lg-" + (sys.argv[1] if len(sys.argv) > 1 else "default")
     config = {"configurable": {"thread_id": thread_id}}
-    context = Context(resume=load_resume())
+    context = Context(resume=load_resume(), user_id=USER_ID)
+    tracked_ns = ("users", USER_ID, "tracked_jobs")
 
-    with PostgresSaver.from_conn_string(DATABASE_URL) as checkpointer:
+    # İki ayrı Postgres bağlantısı: checkpointer (thread hafızası) ve store (kullanıcı hafızası)
+    with PostgresSaver.from_conn_string(DATABASE_URL) as checkpointer, \
+         PostgresStore.from_conn_string(DATABASE_URL) as store:
         checkpointer.setup()
-        graph = build_graph(checkpointer)
+        store.setup()  # store tablolarını oluşturur; varsa dokunmaz
+        graph = build_graph(checkpointer, store)
 
         try:
             print(graph.get_graph().draw_ascii())  # grandalf kuruluysa kutulu çizim
@@ -72,7 +77,7 @@ if __name__ == "__main__":
             print(graph.get_graph().draw_mermaid())  # yoksa Mermaid metni (paket gerektirmez)
         state = graph.get_state(config).values
         print(f"Thread: {thread_id} | kayıtlı mesaj: {len(state.get('messages', []))} | "
-              f"takipte: {len(state.get('tracked_jobs', []))} ilan")
+              f"kullanıcı: {USER_ID} | takipte (store): {len(store.search(tracked_ns, limit=100))} ilan")
         print("Çıkmak için 'q', state'i görmek için '/state' yaz.\n")
 
         while True:
@@ -83,7 +88,7 @@ if __name__ == "__main__":
                 s = graph.get_state(config).values
                 print(f"mesaj: {len(s.get('messages', []))} | intent: {s.get('intent')}")
                 print(f"matches: {[(m['job_id'], m['score']) for m in s.get('matches', [])]}")
-                print(f"tracked_jobs: {[j['title'] for j in s.get('tracked_jobs', [])]}\n")
+                print(f"store {tracked_ns}: {[item.key for item in store.search(tracked_ns, limit=100)]}\n")
                 continue
             print("Agent:")
             stream_graph(graph, {"messages": [{"role": "user", "content": question}]}, context, config)

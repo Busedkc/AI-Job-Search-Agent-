@@ -10,11 +10,12 @@ Kullanım: python -m langgraph_agent.time_travel adim3b
 import sys
 
 from langgraph.checkpoint.postgres import PostgresSaver
+from langgraph.store.postgres import PostgresStore
 from langgraph.types import Command
 
 from langgraph_agent.graph import Context, build_graph
 from langgraph_agent.main import stream_graph
-from shared.config import DATABASE_URL
+from shared.config import DATABASE_URL, USER_ID
 from shared.resume import load_resume
 
 
@@ -23,20 +24,16 @@ def last_user_message(snapshot) -> str:
     return humans[-1].content[:40] if humans else "-"
 
 
-def tracked_ids(snapshot) -> list[int]:
-    return [j["id"] for j in snapshot.values.get("tracked_jobs", [])]
-
-
 def time_travel(graph, config: dict, context: Context) -> None:
     # Yeniden eskiye sıralı geliyor; okunması kolay olsun diye çeviriyoruz
     history = list(graph.get_state_history(config))[::-1]
 
     print(f"\nCheckpoint geçmişi ({len(history)} adet):")
-    print(f"{'step':>4}  {'sıradaki node':<16} {'takipte':<10} son kullanıcı mesajı")
+    print(f"{'step':>4}  {'sıradaki node':<16} son kullanıcı mesajı")
     for s in history:
         nxt = ", ".join(s.next) or "(bitti)"
         mark = "  ✋" if s.interrupts else ""
-        print(f"{s.metadata.get('step', '?'):>4}  {nxt:<16} {str(tracked_ids(s)):<10} {last_user_message(s)}{mark}")
+        print(f"{s.metadata.get('step', '?'):>4}  {nxt:<16} {last_user_message(s)}{mark}")
 
     points = [s for s in history if s.next == ("confirm_track",) and s.interrupts]
     if not points:
@@ -45,7 +42,7 @@ def time_travel(graph, config: dict, context: Context) -> None:
 
     print("\nOnay sorulan noktalar:")
     for i, s in enumerate(points):
-        print(f"  [{i}] step {s.metadata.get('step')}: {s.interrupts[0].value['jobs']} | o an takipte: {tracked_ids(s)}")
+        print(f"  [{i}] step {s.metadata.get('step')}: {s.interrupts[0].value['jobs']}")
     while True:
         raw = input(f"Hangisine dönelim? Köşeli parantezdeki numarayı yaz (0-{len(points) - 1}): ").strip()
         if raw.isdigit() and int(raw) < len(points):
@@ -70,16 +67,19 @@ def time_travel(graph, config: dict, context: Context) -> None:
         answer = input("(e/h): ").strip()
         stream_graph(graph, Command(resume=answer), context, config)
 
-    head = graph.get_state(config)
-    print(f"Şimdiki takip listesi: {tracked_ids(head)}")
+    ns = ("users", context.user_id, "tracked_jobs")
+    print(f"Store'daki takip listesi: {[item.key for item in graph.store.search(ns, limit=100)]}")
     print(f"Toplam checkpoint: {len(history)} → {len(list(graph.get_state_history(config)))} "
           "(eski dal silinmedi, yenisi eklendi)")
     print("Not: seçtiğin noktadan SONRAKİ turlar bu yeni dalda yok; konuşma oradan devam ediyor.")
+    print("Dikkat: time travel sadece checkpoint'leri (konuşmayı) geri sarar; store geri sarılmaz.")
 
 
 if __name__ == "__main__":
     thread_id = "lg-" + (sys.argv[1] if len(sys.argv) > 1 else "default")
     config = {"configurable": {"thread_id": thread_id}}
-    with PostgresSaver.from_conn_string(DATABASE_URL) as checkpointer:
+    with PostgresSaver.from_conn_string(DATABASE_URL) as checkpointer, \
+         PostgresStore.from_conn_string(DATABASE_URL) as store:
         checkpointer.setup()
-        time_travel(build_graph(checkpointer), config, Context(resume=load_resume()))
+        store.setup()
+        time_travel(build_graph(checkpointer, store), config, Context(resume=load_resume(), user_id=USER_ID))

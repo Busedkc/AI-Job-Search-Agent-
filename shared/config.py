@@ -12,3 +12,6 @@ MODEL = os.getenv("MODEL", "groq:openai/gpt-oss-120b")
 SCORER_MODEL = os.getenv("SCORER_MODEL") or MODEL
 DATA_DIR = ROOT_DIR / "shared" / "data"
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://jobagent:jobagent@localhost:5433/jobagent")
+
+# Store'da verinin kime ait olduğu (çok kullanıcılı bir uygulamada login'den gelirdi)
+USER_ID = os.getenv("USER_ID", "me")

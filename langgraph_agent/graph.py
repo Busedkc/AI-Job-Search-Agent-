@@ -1,4 +1,4 @@
-"""LangGraph Adım 3: sabit akış + yönlendirme + interrupt (onay).
+"""LangGraph Adım 5: sabit akış + yönlendirme + interrupt (onay) + store (uzun süreli hafıza).
 
     START → router ─┬─ search → plan_search → search → score ──────────────┐
                     ├─ track  → confirm_track ──(onay)──→ track ───────────┤
@@ -8,6 +8,8 @@
 
 LangChain'de hangi tool'un ne zaman çağrılacağına model karar veriyordu.
 Burada akışı graph belirliyor; model sadece router (sınıflandırma), score ve respond'da çalışıyor.
+
+Takip listesi state'te değil store'da: thread'e değil kullanıcıya ait, bütün konuşmalarda ortak.
 """
 import json
 from dataclasses import dataclass
@@ -31,6 +33,7 @@ from shared.scoring import SCORING_PROMPT, MatchReport, build_scoring_input
 @dataclass
 class Context:
     resume: str
+    user_id: str  # store'da kimin verisi olduğunu belirler
 
 
 class State(TypedDict):
@@ -42,7 +45,7 @@ class State(TypedDict):
     keywords: NotRequired[str]
     jobs: NotRequired[list[dict]]
     matches: NotRequired[list[dict]]
-    tracked_jobs: NotRequired[list[dict]]
+    # tracked_jobs artık burada değil, store'da (bkz. tracked_namespace)
     action_result: NotRequired[str]      # track/list node'unun respond'a bıraktığı not
     confirmed: NotRequired[bool]         # confirm_track'te kullanıcının cevabı
 
@@ -67,6 +70,18 @@ def chat_history(messages: list[AnyMessage], last_n: int = 6) -> list[AnyMessage
     """Modele sadece kullanıcı ve asistan metinlerini gönder (tool mesajları vs. yok)."""
     text_msgs = [m for m in messages if isinstance(m, (HumanMessage, AIMessage)) and m.content]
     return text_msgs[-last_n:]
+
+
+# --- Store yardımcıları ------------------------------------------------------
+# Store bir anahtar-değer deposu: (namespace, key) -> value.
+# Her takip edilen ilan ayrı bir kayıt: ("users", <user_id>, "tracked_jobs"), key = ilan id'si.
+def tracked_namespace(runtime: Runtime[Context]) -> tuple[str, ...]:
+    return ("users", runtime.context.user_id, "tracked_jobs")
+
+
+def get_tracked(runtime: Runtime[Context]) -> list[dict]:
+    items = runtime.store.search(tracked_namespace(runtime), limit=100)
+    return [item.value for item in items]
 
 
 # --- Node'lar ----------------------------------------------------------------
@@ -108,14 +123,14 @@ def score(state: State, runtime: Runtime[Context]) -> dict:
     return {"matches": [m.model_dump() for m in ranked]}
 
 
-def confirm_track(state: State) -> dict:
+def confirm_track(state: State, runtime: Runtime[Context]) -> dict:
     """Human-in-the-loop: takibe almadan önce kullanıcıya sorar.
 
     interrupt() graph'ı burada durdurur, state checkpointer'a yazılır. Command(resume=...)
     ile devam edilince bu node BAŞTAN çalışır ve interrupt() kullanıcının cevabını döndürür.
     Bu yüzden interrupt'tan önceki kod deterministik olmalı (burada sadece okuma yapıyoruz).
     """
-    tracked_ids = {j["id"] for j in state.get("tracked_jobs", [])}
+    tracked_ids = {j["id"] for j in get_tracked(runtime)}  # sadece okuma: tekrar çalışması güvenli
     candidates = [job for i in state.get("job_ids", [])
                   if i not in tracked_ids and (job := job_source.get_job(i))]
     if not candidates:
@@ -135,26 +150,28 @@ def route_after_confirm(state: State) -> str:
     return "track" if state["confirmed"] else "respond"
 
 
-def track(state: State) -> dict:
-    tracked = list(state.get("tracked_jobs", []))
+def track(state: State, runtime: Runtime[Context]) -> dict:
+    """Store'a yazar. interrupt'tan sonra, ayrı bir node'da: onay gelmeden yazma olmaz."""
+    tracked_ids = {j["id"] for j in get_tracked(runtime)}
     notes = []
     for job_id in state.get("job_ids", []):
         job = job_source.get_job(job_id)
         if job is None:
             notes.append(f"{job_id} id'li ilan bulunamadı.")
-        elif any(j["id"] == job_id for j in tracked):
+        elif job_id in tracked_ids:
             notes.append(f"'{job['title']}' zaten takipte.")
         else:
-            tracked.append(job)
+            runtime.store.put(tracked_namespace(runtime), str(job_id), job)
+            tracked_ids.add(job_id)
             expired = " (dikkat: son başvuru tarihi geçmiş)" if job_source.is_expired(job) else ""
             notes.append(f"'{job['title']}' ({job['company']}) takibe alındı, son başvuru {job['deadline']}{expired}.")
     if not notes:
         notes.append("Hangi ilanı takibe almamı istediğini anlayamadım, id'sini yazar mısın?")
-    return {"tracked_jobs": tracked, "action_result": " ".join(notes)}
+    return {"action_result": " ".join(notes)}
 
 
-def list_tracked(state: State) -> dict:
-    tracked = sorted(state.get("tracked_jobs", []), key=lambda j: j["deadline"])
+def list_tracked(state: State, runtime: Runtime[Context]) -> dict:
+    tracked = sorted(get_tracked(runtime), key=lambda j: j["deadline"])
     if not tracked:
         return {"action_result": "Takip listen boş."}
     lines = [f"- #{j['id']} {j['title']} – {j['company']} (son başvuru {j['deadline']})"
@@ -192,7 +209,7 @@ def respond(state: State) -> dict:
 
 
 # --- Graph -------------------------------------------------------------------
-def build_graph(checkpointer=None):
+def build_graph(checkpointer=None, store=None):
     builder = StateGraph(State, context_schema=Context)
 
     builder.add_node("router", router, retry_policy=RETRY)
@@ -215,4 +232,5 @@ def build_graph(checkpointer=None):
     builder.add_edge("list_tracked", "respond")
     builder.add_edge("respond", END)
 
-    return builder.compile(checkpointer=checkpointer)
+    # checkpointer: thread'in kısa süreli hafızası | store: kullanıcının uzun süreli hafızası
+    return builder.compile(checkpointer=checkpointer, store=store)
