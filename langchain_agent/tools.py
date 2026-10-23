@@ -10,7 +10,7 @@ from langgraph.types import Command
 
 from shared import job_source
 from shared.config import SCORER_MODEL
-from shared.scoring import SCORING_PROMPT, MatchReport, build_scoring_input
+from shared.scoring import SCORING_PROMPT, MatchReport, apply_rules, build_scoring_input
 
 # Değerlendirme için ayrı bir model çağrısı: temperature=0 ile her seferinde aynı girdiye
 # mümkün olduğunca aynı skor. with_structured_output cevabı MatchReport'a zorlar.
@@ -99,5 +99,5 @@ def evaluate_jobs(job_ids: list[int], runtime: ToolRuntime[Context]) -> str:
         {"role": "user", "content": build_scoring_input(runtime.context.resume, jobs)},
     ])
     # Pydantic doğrulamasından geçmiş nesne: alanlar ve tipler garanti
-    ranked = sorted(report.matches, key=lambda m: m.score, reverse=True)
+    ranked = apply_rules(report)  # kesin kurallar + sıralama kodda
     return json.dumps([m.model_dump() for m in ranked], ensure_ascii=False)

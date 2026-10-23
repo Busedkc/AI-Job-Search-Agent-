@@ -1,6 +1,6 @@
-"""LangGraph Adım 5: sabit akış + yönlendirme + interrupt (onay) + store (uzun süreli hafıza).
+"""LangGraph Adım 6: sabit akış + yönlendirme + interrupt (onay) + store + subgraph.
 
-    START → router ─┬─ search → plan_search → search → score ──────────────┐
+    START → router ─┬─ search → search_jobs [subgraph: plan_search → search → score] ─┐
                     ├─ track  → confirm_track ──(onay)──→ track ───────────┤
                     │                        └──(ret)──────────────────────┤
                     ├─ list   → list_tracked ─────────────────┼→ respond → END
@@ -10,9 +10,9 @@ LangChain'de hangi tool'un ne zaman çağrılacağına model karar veriyordu.
 Burada akışı graph belirliyor; model sadece router (sınıflandırma), score ve respond'da çalışıyor.
 
 Takip listesi state'te değil store'da: thread'e değil kullanıcıya ait, bütün konuşmalarda ortak.
+Arama akışı search_graph.py'da ayrı bir graph; burada tek bir node olarak ekleniyor.
 """
 import json
-from dataclasses import dataclass
 from typing import Annotated, Literal, NotRequired, TypedDict
 
 from langchain.chat_models import init_chat_model
@@ -23,17 +23,13 @@ from langgraph.runtime import Runtime
 from langgraph.types import RetryPolicy, interrupt
 from pydantic import BaseModel, Field
 
+from langgraph_agent.context import Context  # main.py ve time_travel.py buradan import ediyor
+from langgraph_agent.search_graph import build_search_graph
 from shared import job_source
-from shared.config import MODEL, SCORER_MODEL
-from shared.resume import parse_target_roles
-from shared.scoring import SCORING_PROMPT, MatchReport, build_scoring_input
+from shared.config import MODEL
 
 
-# --- Context ve State ------------------------------------------------------
-@dataclass
-class Context:
-    resume: str
-    user_id: str  # store'da kimin verisi olduğunu belirler
+# --- State -------------------------------------------------------------------
 
 
 class State(TypedDict):
@@ -42,7 +38,7 @@ class State(TypedDict):
     # Burada her biri ayrı, tipli bir state alanı.
     intent: NotRequired[str]
     job_ids: NotRequired[list[int]]      # router'ın mesajdan çıkardığı id'ler (takip için)
-    keywords: NotRequired[str]
+    keywords: NotRequired[str]           # bu üçünü search_jobs subgraph'ı yazıyor
     jobs: NotRequired[list[dict]]
     matches: NotRequired[list[dict]]
     # tracked_jobs artık burada değil, store'da (bkz. tracked_namespace)
@@ -60,7 +56,6 @@ class Route(BaseModel):
 
 
 router_model = init_chat_model(MODEL, temperature=0).with_structured_output(Route)
-scorer = init_chat_model(SCORER_MODEL, temperature=0).with_structured_output(MatchReport)
 chat_model = init_chat_model(MODEL)
 
 RETRY = RetryPolicy(max_attempts=5, initial_interval=2.0)
@@ -96,31 +91,8 @@ def router(state: State) -> dict:
 
 
 def route_after_router(state: State) -> str:
-    return {"search": "plan_search", "track": "confirm_track", "list": "list_tracked"}.get(
+    return {"search": "search_jobs", "track": "confirm_track", "list": "list_tracked"}.get(
         state["intent"], "respond")
-
-
-def plan_search(state: State, runtime: Runtime[Context]) -> dict:
-    """Arama kelimelerini CV'den düz Python ile çıkarır. LLM yok, token yok."""
-    roles = parse_target_roles(runtime.context.resume)
-    keywords = " ".join(roles).replace("/", " ") or "machine learning engineer"
-    return {"keywords": keywords}
-
-
-def search(state: State) -> dict:
-    return {"jobs": job_source.search_jobs(state["keywords"])}
-
-
-def score(state: State, runtime: Runtime[Context]) -> dict:
-    """Her aramada bir kez çalışır. Model "skorlamayı atlayayım" diyemez."""
-    if not state["jobs"]:
-        return {"matches": []}
-    report: MatchReport = scorer.invoke([
-        SystemMessage(SCORING_PROMPT),
-        HumanMessage(build_scoring_input(runtime.context.resume, state["jobs"])),
-    ])
-    ranked = sorted(report.matches, key=lambda m: m.score, reverse=True)
-    return {"matches": [m.model_dump() for m in ranked]}
 
 
 def confirm_track(state: State, runtime: Runtime[Context]) -> dict:
@@ -213,9 +185,8 @@ def build_graph(checkpointer=None, store=None):
     builder = StateGraph(State, context_schema=Context)
 
     builder.add_node("router", router, retry_policy=RETRY)
-    builder.add_node("plan_search", plan_search)
-    builder.add_node("search", search)
-    builder.add_node("score", score, retry_policy=RETRY)
+    # Derlenmiş bir graph'ı doğrudan node olarak eklemek: subgraph
+    builder.add_node("search_jobs", build_search_graph())
     builder.add_node("confirm_track", confirm_track)
     builder.add_node("track", track)
     builder.add_node("list_tracked", list_tracked)
@@ -223,11 +194,9 @@ def build_graph(checkpointer=None, store=None):
 
     builder.add_edge(START, "router")
     builder.add_conditional_edges("router", route_after_router,
-                                  ["plan_search", "confirm_track", "list_tracked", "respond"])
+                                  ["search_jobs", "confirm_track", "list_tracked", "respond"])
     builder.add_conditional_edges("confirm_track", route_after_confirm, ["track", "respond"])
-    builder.add_edge("plan_search", "search")
-    builder.add_edge("search", "score")
-    builder.add_edge("score", "respond")
+    builder.add_edge("search_jobs", "respond")
     builder.add_edge("track", "respond")
     builder.add_edge("list_tracked", "respond")
     builder.add_edge("respond", END)

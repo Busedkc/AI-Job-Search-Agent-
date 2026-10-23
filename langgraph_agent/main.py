@@ -11,6 +11,13 @@ from shared.resume import load_resume
 
 def describe_update(node: str, update: dict) -> str | None:
     """Her node bitince ekrana tek satırlık özet."""
+    if node == "search_jobs":
+        return f"📦 search_jobs (subgraph) bitti → {len(update.get('matches', []))} değerlendirme ana state'e geçti"
+    return _describe(node, update)
+
+
+def _describe(node: str, update: dict) -> str | None:
+    """Her node bitince ekrana tek satırlık özet."""
     if node == "router":
         return f"🔀 router: niyet = {update['intent']}" + (f", id'ler = {update['job_ids']}" if update.get("job_ids") else "")
     if node == "plan_search":
@@ -38,6 +45,7 @@ def stream_graph(graph, graph_input, context: Context, config: dict) -> None:
         config=config,
         context=context,
         stream_mode=["messages", "updates"],
+        subgraphs=True,  # subgraph içindeki node'ların olaylarını da getir
         version="v2",
     ):
         if chunk["type"] == "messages":
@@ -48,13 +56,15 @@ def stream_graph(graph, graph_input, context: Context, config: dict) -> None:
                 streamed = True
 
         elif chunk["type"] == "updates":
+            # ns: olayın hangi graph'tan geldiği. () = ana graph, ("search_jobs:<id>",) = subgraph
+            indent = "    ↳ " if chunk["ns"] else ""
             for node, update in chunk["data"].items():
                 if node == "respond" and not streamed:
                     print(update["messages"][-1].content)  # LLM'siz cevap: token akmadı, tek seferde bas
                     continue
                 line = describe_update(node, update if isinstance(update, dict) else {})
                 if line:
-                    print(line)
+                    print(indent + line)
     print()
 
 
@@ -72,9 +82,9 @@ if __name__ == "__main__":
         graph = build_graph(checkpointer, store)
 
         try:
-            print(graph.get_graph().draw_ascii())  # grandalf kuruluysa kutulu çizim
+            print(graph.get_graph(xray=True).draw_ascii())  # xray: subgraph içini de çiz
         except ImportError:
-            print(graph.get_graph().draw_mermaid())  # yoksa Mermaid metni (paket gerektirmez)
+            print(graph.get_graph(xray=True).draw_mermaid())  # grandalf yoksa Mermaid metni
         state = graph.get_state(config).values
         print(f"Thread: {thread_id} | kayıtlı mesaj: {len(state.get('messages', []))} | "
               f"kullanıcı: {USER_ID} | takipte (store): {len(store.search(tracked_ns, limit=100))} ilan")
